@@ -2,8 +2,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import os
-from datetime import datetime, timedelta
-import httpx
+from datetime import datetime, timedelta, date
+import hashlib
  
 app = FastAPI(title="GC O&M Cloud")
  
@@ -18,7 +18,8 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "https://cjfmjgpbrrexadlqvgst.supabase.
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
  
 GROWATT_USER = os.getenv("GROWATT_USER", "Manoel_Alves_Pereira")
-GROWATT_PASS = os.getenv("GROWATT_PASS", "")
+GROWATT_PASS = os.getenv("GROWATT_PASS", "Manoel1*")
+GROWATT_PLANT = os.getenv("GROWATT_PLANT", "2346835")
  
 def sb_headers():
     return {
@@ -28,9 +29,13 @@ def sb_headers():
         "Prefer": "return=representation"
     }
  
+def growatt_pass_hash(senha):
+    """Growatt exige senha em MD5"""
+    return hashlib.md5(senha.encode()).hexdigest()
+ 
 @app.get("/")
 def root():
-    return {"status": "GC O&M Cloud online", "versao": "1.1"}
+    return {"status": "GC O&M Cloud online", "versao": "1.2"}
  
 @app.get("/clientes")
 async def listar_clientes():
@@ -56,57 +61,128 @@ async def listar_geracoes(plant_id: str, dias: int = 30):
     desde = (datetime.now() - timedelta(days=dias)).strftime("%Y-%m-%d")
     async with httpx.AsyncClient() as client:
         res = await client.get(
-            f"{SUPABASE_URL}/rest/v1/geracoes?plant_id=eq.{plant_id}&data=gte.{desde}&select=*",
+            f"{SUPABASE_URL}/rest/v1/geracoes?plant_id=eq.{plant_id}&data=gte.{desde}&select=*&order=data.desc",
             headers=sb_headers()
         )
         return res.json()
  
 @app.post("/sincronizar")
 async def sincronizar_growatt():
-    ontem = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    """Busca dados reais do Growatt e salva no Supabase"""
+    ontem = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+    
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Login Growatt (senha em MD5)
             login = await client.post(
-                "https://openapi.growatt.com/v1/user/login",
-                json={"account": GROWATT_USER, "password": GROWATT_PASS}
+                "https://server.growatt.com/login",
+                data={
+                    "account": GROWATT_USER,
+                    "password": growatt_pass_hash(GROWATT_PASS),
+                    "validateCode": ""
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"}
             )
-            token = login.json().get("data", {}).get("token", "")
-            if not token:
-                return {"erro": "Login Growatt falhou", "detalhe": login.text}
- 
-            plantas = await client.get(
-                "https://openapi.growatt.com/v1/plant/list",
-                headers={"token": token}
+            
+            cookies = login.cookies
+            
+            if login.status_code != 200:
+                return {"erro": f"Login falhou: HTTP {login.status_code}"}
+            
+            dados = login.json()
+            if dados.get("result") != 1:
+                return {"erro": "Login negado pelo Growatt", "detalhe": dados}
+            
+            # Busca geração do dia para a planta
+            geracao = await client.post(
+                "https://server.growatt.com/panel/plantData/getPlantData",
+                data={
+                    "plantId": GROWATT_PLANT,
+                    "date": ontem
+                },
+                cookies=cookies,
+                headers={"Content-Type": "application/x-www-form-urlencoded"}
             )
-            lista_plantas = plantas.json().get("data", {}).get("plants", [])
- 
-            salvos = []
-            for planta in lista_plantas:
-                pid = str(planta.get("id", ""))
-                nome = planta.get("name", "")
- 
-                geracao = await client.post(
-                    "https://openapi.growatt.com/v1/plant/energy",
-                    headers={"token": token},
-                    json={"plant_id": pid, "start_date": ontem, "end_date": ontem, "time_unit": "day"}
-                )
-                kwh = geracao.json().get("data", {}).get("energys", [{}])[0].get("energy", 0)
- 
-                await client.post(
+            
+            g_json = geracao.json()
+            kwh = float(g_json.get("eDay", 0) or 0)
+            
+            # Salva no Supabase
+            registro = {
+                "plant_id": GROWATT_PLANT,
+                "nome_planta": "Manoel Alves Pereira",
+                "data": ontem,
+                "kwh": kwh,
+                "atualizado_em": datetime.now().isoformat()
+            }
+            
+            async with httpx.AsyncClient() as sb:
+                await sb.post(
                     f"{SUPABASE_URL}/rest/v1/geracoes",
                     headers={**sb_headers(), "Prefer": "resolution=merge-duplicates"},
-                    json={
-                        "plant_id": pid,
-                        "nome_planta": nome,
-                        "data": ontem,
-                        "kwh": float(kwh),
+                    json=registro
+                )
+            
+            return {"status": "ok", "data": ontem, "kwh": kwh, "plant_id": GROWATT_PLANT}
+    
+    except Exception as e:
+        return {"erro": str(e)}
+ 
+@app.get("/sincronizar/historico")
+async def sincronizar_historico(dias: int = 30):
+    """Busca os últimos N dias do Growatt e salva tudo no Supabase"""
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            # Login
+            login = await client.post(
+                "https://server.growatt.com/login",
+                data={
+                    "account": GROWATT_USER,
+                    "password": growatt_pass_hash(GROWATT_PASS),
+                    "validateCode": ""
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"}
+            )
+            
+            if login.status_code != 200 or login.json().get("result") != 1:
+                return {"erro": "Login falhou"}
+            
+            cookies = login.cookies
+            salvos = []
+            
+            for i in range(1, dias + 1):
+                dia = (date.today() - timedelta(days=i)).strftime("%Y-%m-%d")
+                
+                try:
+                    geracao = await client.post(
+                        "https://server.growatt.com/panel/plantData/getPlantData",
+                        data={"plantId": GROWATT_PLANT, "date": dia},
+                        cookies=cookies,
+                        headers={"Content-Type": "application/x-www-form-urlencoded"}
+                    )
+                    kwh = float(geracao.json().get("eDay", 0) or 0)
+                    
+                    registro = {
+                        "plant_id": GROWATT_PLANT,
+                        "nome_planta": "Manoel Alves Pereira",
+                        "data": dia,
+                        "kwh": kwh,
                         "atualizado_em": datetime.now().isoformat()
                     }
-                )
-                salvos.append({"plant_id": pid, "nome": nome, "kwh": kwh, "data": ontem})
- 
-            return {"status": "ok", "registros": salvos}
- 
+                    
+                    async with httpx.AsyncClient() as sb:
+                        await sb.post(
+                            f"{SUPABASE_URL}/rest/v1/geracoes",
+                            headers={**sb_headers(), "Prefer": "resolution=merge-duplicates"},
+                            json=registro
+                        )
+                    
+                    salvos.append({"data": dia, "kwh": kwh})
+                except:
+                    salvos.append({"data": dia, "erro": "falha"})
+            
+            return {"status": "ok", "registros": len(salvos), "dados": salvos}
+    
     except Exception as e:
         return {"erro": str(e)}
  
@@ -129,4 +205,3 @@ async def dashboard():
             "clientes": dados_clientes,
             "geracoes_recentes": dados_geracoes
         }
- 
